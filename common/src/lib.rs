@@ -11,15 +11,16 @@ use tokio::{
     net::TcpStream as TokioTcpStream,
 };
 
+#[repr(u8)]
 #[derive(Clone, Copy, Encode, Decode)]
 pub enum LogLevel {
-    Unknown,
-    Trace,
-    Debug,
-    Info,
-    Warn,
-    Error,
-    Fatal,
+    Unknown = 0,
+    Trace = 1,
+    Debug = 2,
+    Info = 3,
+    Warn = 4,
+    Error = 5,
+    Fatal = 6,
 }
 
 #[derive(Clone, Encode, Decode)]

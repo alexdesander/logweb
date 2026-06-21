@@ -8,3 +8,5 @@ common = { path = "../common" }
 clap.workspace = true
 tokio.workspace = true
 color-eyre.workspace = true
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+crossbeam = "0.8.4"
