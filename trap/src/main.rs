@@ -7,8 +7,8 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc::{Receiver, RecvTimeoutError},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc::{Receiver, RecvTimeoutError, TrySendError},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -38,6 +38,10 @@ struct Cli {
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
     retry_secs: u64,
 
+    /// Maximum number of logs to queue before skipping incoming logs.
+    #[arg(long, default_value_t = 10_000, value_parser = clap::value_parser!(usize))]
+    max_queue_logs: usize,
+
     /// Text file containing level=regex mappings for log classification.
     #[arg(long)]
     level_regex_file: Option<PathBuf>,
@@ -60,6 +64,9 @@ fn main() -> Result<()> {
     color_eyre::install()?;
 
     let cli = Cli::parse();
+    let spider_addr = cli.spider_addr;
+    let max_queue_logs = cli.max_queue_logs;
+
     let classifier = match &cli.level_regex_file {
         Some(path) => LogClassifier::from_file(path)?,
         None => LogClassifier::new(),
@@ -74,11 +81,19 @@ fn main() -> Result<()> {
     };
 
     let connected = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = std::sync::mpsc::channel();
+    let skipped_logs = Arc::new(AtomicUsize::new(0));
+    let (tx, rx) = std::sync::mpsc::sync_channel(max_queue_logs);
 
     let sending_connected = Arc::clone(&connected);
+    let sending_skipped_logs = Arc::clone(&skipped_logs);
     let sending_thread = std::thread::spawn(move || {
-        sending_thread(cli.spider_addr, config, rx, sending_connected);
+        sending_thread(
+            spider_addr,
+            config,
+            rx,
+            sending_connected,
+            sending_skipped_logs,
+        );
     });
 
     for line in io::stdin().lock().lines() {
@@ -95,8 +110,17 @@ fn main() -> Result<()> {
             },
         };
 
-        if connected.load(Ordering::Relaxed) && tx.send(queued_log).is_err() {
-            break;
+        if !connected.load(Ordering::Relaxed) {
+            skipped_logs.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+
+        match tx.try_send(queued_log) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                skipped_logs.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Disconnected(_)) => break,
         }
     }
 
@@ -111,6 +135,7 @@ fn sending_thread(
     config: Config,
     rx: Receiver<QueuedLog>,
     connected: Arc<AtomicBool>,
+    skipped_logs: Arc<AtomicUsize>,
 ) {
     loop {
         connected.store(false, Ordering::Relaxed);
@@ -118,7 +143,7 @@ fn sending_thread(
         let stream = match TcpStream::connect(spider_addr) {
             Ok(stream) => stream,
             Err(_) => {
-                if !drop_logs_until_retry(&rx, config.retry_delay) {
+                if !drop_logs_until_retry(&rx, config.retry_delay, &skipped_logs) {
                     return;
                 }
                 continue;
@@ -128,7 +153,10 @@ fn sending_thread(
         let mut sender = LogwebSender::new(stream);
         connected.store(true, Ordering::Relaxed);
 
-        if send_connected(&mut sender, &rx, &config).is_ok() {
+        if send_truncated_if_needed(&mut sender, &config.producer, &skipped_logs)
+            .and_then(|_| send_connected(&mut sender, &rx, &config, &skipped_logs))
+            .is_ok()
+        {
             connected.store(false, Ordering::Relaxed);
             let _ = sender.finish();
             return;
@@ -137,7 +165,7 @@ fn sending_thread(
         connected.store(false, Ordering::Relaxed);
         drop(sender);
 
-        if !drop_logs_until_retry(&rx, config.retry_delay) {
+        if !drop_logs_until_retry(&rx, config.retry_delay, &skipped_logs) {
             return;
         }
     }
@@ -147,6 +175,7 @@ fn send_connected(
     sender: &mut LogwebSender,
     rx: &Receiver<QueuedLog>,
     config: &Config,
+    skipped_logs: &AtomicUsize,
 ) -> io::Result<()> {
     let mut batch = Vec::new();
     let mut batch_bytes = 0;
@@ -154,7 +183,11 @@ fn send_connected(
 
     loop {
         if batch.is_empty() {
-            let Ok(mut queued_log) = rx.recv() else { break };
+            send_truncated_if_needed(sender, &config.producer, skipped_logs)?;
+
+            let Ok(mut queued_log) = rx.recv() else {
+                break;
+            };
 
             batch_started = Instant::now();
             batch_bytes = queued_log.approx_bytes;
@@ -188,10 +221,16 @@ fn send_connected(
         flush(sender, &config.producer, &mut batch)?;
     }
 
+    send_truncated_if_needed(sender, &config.producer, skipped_logs)?;
+
     Ok(())
 }
 
-fn drop_logs_until_retry(rx: &Receiver<QueuedLog>, retry_delay: Duration) -> bool {
+fn drop_logs_until_retry(
+    rx: &Receiver<QueuedLog>,
+    retry_delay: Duration,
+    skipped_logs: &AtomicUsize,
+) -> bool {
     let retry_at = Instant::now() + retry_delay;
 
     loop {
@@ -202,11 +241,38 @@ fn drop_logs_until_retry(rx: &Receiver<QueuedLog>, retry_delay: Duration) -> boo
         }
 
         match rx.recv_timeout(remaining) {
-            Ok(_) => {}
+            Ok(_) => {
+                skipped_logs.fetch_add(1, Ordering::Relaxed);
+            }
             Err(RecvTimeoutError::Timeout) => return true,
             Err(RecvTimeoutError::Disconnected) => return false,
         }
     }
+}
+
+fn send_truncated_if_needed(
+    sender: &mut LogwebSender,
+    producer: &str,
+    skipped_logs: &AtomicUsize,
+) -> io::Result<()> {
+    let skipped = skipped_logs.swap(0, Ordering::Relaxed);
+
+    if skipped == 0 {
+        return Ok(());
+    }
+
+    let result = sender
+        .send(&Message {
+            producer: producer.to_string(),
+            content: MessageContent::Truncated,
+        })
+        .and_then(|_| sender.flush());
+
+    if result.is_err() {
+        skipped_logs.fetch_add(skipped, Ordering::Relaxed);
+    }
+
+    result
 }
 
 fn flush(sender: &mut LogwebSender, producer: &str, batch: &mut Vec<Log>) -> io::Result<()> {
