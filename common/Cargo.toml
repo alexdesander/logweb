@@ -4,3 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+async-compression = { version = "0.4.42", features = ["lz4", "tokio", "futures-io"] }
+bitcode.workspace = true
+futures = "0.3.32"
+tokio.workspace = true
