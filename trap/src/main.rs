@@ -3,7 +3,7 @@ use color_eyre::eyre::Result;
 use common::{Log, LogLevel, LogwebSender, Message, MessageContent};
 use std::{
     io::{self, BufRead},
-    net::{SocketAddr, TcpStream},
+    net::TcpStream,
     path::PathBuf,
     sync::{
         Arc,
@@ -20,8 +20,13 @@ mod classification;
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
-    /// The socket address of the spider to connect to.
-    spider_addr: SocketAddr,
+    /// The spider endpoint to connect to.
+    ///
+    /// Examples:
+    /// - 127.0.0.1:9000
+    /// - [::1]:9000
+    /// - logs.example.com:9000
+    spider_endpoint: String,
 
     /// Producer name to attach to outgoing log messages.
     producer: String,
@@ -64,7 +69,7 @@ fn main() -> Result<()> {
     color_eyre::install()?;
 
     let cli = Cli::parse();
-    let spider_addr = cli.spider_addr;
+    let spider_endpoint = cli.spider_endpoint;
     let max_queue_logs = cli.max_queue_logs;
 
     let classifier = match &cli.level_regex_file {
@@ -88,7 +93,7 @@ fn main() -> Result<()> {
     let sending_skipped_logs = Arc::clone(&skipped_logs);
     let sending_thread = std::thread::spawn(move || {
         sending_thread(
-            spider_addr,
+            spider_endpoint,
             config,
             rx,
             sending_connected,
@@ -131,7 +136,7 @@ fn main() -> Result<()> {
 }
 
 fn sending_thread(
-    spider_addr: SocketAddr,
+    spider_endpoint: String,
     config: Config,
     rx: Receiver<QueuedLog>,
     connected: Arc<AtomicBool>,
@@ -140,7 +145,7 @@ fn sending_thread(
     loop {
         connected.store(false, Ordering::Relaxed);
 
-        let stream = match TcpStream::connect(spider_addr) {
+        let stream = match TcpStream::connect(spider_endpoint.as_str()) {
             Ok(stream) => stream,
             Err(_) => {
                 if !drop_logs_until_retry(&rx, config.retry_delay, &skipped_logs) {
