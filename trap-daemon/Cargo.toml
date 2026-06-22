@@ -1,0 +1,13 @@
+[package]
+name = "trap-daemon"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap.workspace = true
+common = { path = "../common" }
+crossbeam = "0.8.4"
+libc = "0.2.186"
+libsystemd-sys = "0.9.4"
+parking_lot = "0.12.5"
+zstd = { version = "0.13.3" }

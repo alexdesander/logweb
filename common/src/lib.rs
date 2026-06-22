@@ -1,176 +1,99 @@
-use std::{
-    io,
-    net::TcpStream as StdTcpStream,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::io::{self, Read, Write};
 
-use async_compression::{futures::write::Lz4Encoder as SyncLz4Encoder, tokio::bufread::Lz4Decoder};
-use bitcode::{Decode, Encode};
-use futures::{
-    executor::block_on,
-    io::{AllowStdIo, AsyncWriteExt},
-};
-use tokio::{
-    io::{AsyncReadExt, BufReader},
-    net::TcpStream as TokioTcpStream,
-};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
-#[repr(u8)]
-#[derive(Clone, Copy, Encode, Decode)]
-pub enum LogLevel {
-    Unknown = 0,
-    Trace = 1,
-    Debug = 2,
-    Info = 3,
-    Warn = 4,
-    Error = 5,
-    Fatal = 6,
+pub const MAX_PRODUCER_SIZE: usize = 255;
+pub const MAX_MESSAGE_SIZE: usize = 65535;
+pub const LOG_HEADER_SIZE: usize = 8 + 1 + 2;
+
+pub fn serialized_log_len(producer: &[u8], message: &[u8]) -> usize {
+    LOG_HEADER_SIZE + producer.len().min(MAX_PRODUCER_SIZE) + message.len().min(MAX_MESSAGE_SIZE)
 }
 
-#[derive(Clone, Encode, Decode)]
-pub struct Log {
-    /// unix timestamp (UTC)
-    pub occurrence: u64,
-    pub level: LogLevel,
-    pub content: String,
+pub fn serialize_log<W: Write>(
+    mut dst: W,
+    timestamp: u64,
+    producer: &[u8],
+    message: &[u8],
+) -> io::Result<usize> {
+    let producer_len: u8 = producer.len().min(MAX_PRODUCER_SIZE) as u8;
+    let producer = &producer[..producer_len as usize];
+
+    let message_len: u16 = message.len().min(MAX_MESSAGE_SIZE) as u16;
+    let message = &message[..message_len as usize];
+
+    dst.write_all(&timestamp.to_le_bytes())?;
+    dst.write_all(&[producer_len])?;
+    dst.write_all(producer)?;
+    dst.write_all(&message_len.to_le_bytes())?;
+    dst.write_all(message)?;
+
+    Ok(serialized_log_len(producer, message))
 }
 
-#[derive(Clone, Encode, Decode)]
-pub enum MessageContent {
-    TrapInit { occurrence: u64 },
-    TrapDown { occurrence: u64 },
-    Logs(Vec<Log>),
-    Truncated,
-}
-
-#[derive(Clone, Encode, Decode)]
-pub struct Message {
+pub struct OwnedLog {
+    pub timestamp: u64,
     pub producer: String,
-    pub content: MessageContent,
+    pub message: String,
 }
 
-pub struct LogwebSender {
-    producer: String,
-    stream: SyncLz4Encoder<AllowStdIo<StdTcpStream>>,
-    buffer: bitcode::Buffer,
-    finished: bool,
+pub fn deserialize_log<R: Read>(reader: &mut R) -> io::Result<OwnedLog> {
+    let mut timestamp_buf = [0u8; 8];
+    reader.read_exact(&mut timestamp_buf)?;
+    let timestamp = u64::from_le_bytes(timestamp_buf);
+
+    let mut producer_len_buf = [0u8; 1];
+    reader.read_exact(&mut producer_len_buf)?;
+    let producer_len = producer_len_buf[0] as usize;
+
+    let mut producer = vec![0u8; producer_len];
+    reader.read_exact(&mut producer)?;
+
+    let mut message_len_buf = [0u8; 2];
+    reader.read_exact(&mut message_len_buf)?;
+    let message_len = u16::from_le_bytes(message_len_buf) as usize;
+
+    let mut message = vec![0u8; message_len];
+    reader.read_exact(&mut message)?;
+
+    let producer = String::from_utf8_lossy(&producer).into_owned();
+    let message = String::from_utf8_lossy(&message).into_owned();
+
+    Ok(OwnedLog {
+        timestamp,
+        producer,
+        message,
+    })
 }
 
-impl LogwebSender {
-    pub fn new(producer: String, stream: StdTcpStream) -> Self {
-        let mut s = Self {
-            producer: producer.clone(),
-            stream: SyncLz4Encoder::new(AllowStdIo::new(stream)),
-            buffer: bitcode::Buffer::new(),
-            finished: false,
-        };
-        let _ = s.send(&Message {
-            producer,
-            content: MessageContent::TrapInit {
-                occurrence: unix_timestamp(),
-            },
-        });
-        let _ = s.flush();
-        s
-    }
+pub async fn deserialize_log_async<R>(reader: &mut R) -> io::Result<OwnedLog>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut timestamp_buf = [0u8; 8];
+    reader.read_exact(&mut timestamp_buf).await?;
+    let timestamp = u64::from_le_bytes(timestamp_buf);
 
-    pub fn send(&mut self, msg: &Message) -> io::Result<()> {
-        if self.finished {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "sender has already been finished",
-            ));
-        }
+    let mut producer_len_buf = [0u8; 1];
+    reader.read_exact(&mut producer_len_buf).await?;
+    let producer_len = producer_len_buf[0] as usize;
 
-        let encoded = self.buffer.encode(msg);
+    let mut producer = vec![0u8; producer_len];
+    reader.read_exact(&mut producer).await?;
 
-        let len = u32::try_from(encoded.len()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "encoded message is larger than u32::MAX bytes",
-            )
-        })?;
+    let mut message_len_buf = [0u8; 2];
+    reader.read_exact(&mut message_len_buf).await?;
+    let message_len = u16::from_le_bytes(message_len_buf) as usize;
 
-        block_on(async {
-            self.stream.write_all(&len.to_be_bytes()).await?;
-            self.stream.write_all(encoded).await?;
-            Ok::<_, io::Error>(())
-        })
-    }
+    let mut message = vec![0u8; message_len];
+    reader.read_exact(&mut message).await?;
 
-    pub fn flush(&mut self) -> io::Result<()> {
-        if self.finished {
-            return Ok(());
-        }
+    let producer = String::from_utf8_lossy(&producer).into_owned();
+    let message = String::from_utf8_lossy(&message).into_owned();
 
-        block_on(self.stream.flush())
-    }
-
-    /// Finishes the LZ4 frame.
-    ///
-    /// Call this when no more messages will be sent so compression-finalization
-    /// errors can be observed by the caller.
-    pub fn finish(&mut self) -> io::Result<()> {
-        if self.finished {
-            return Ok(());
-        }
-
-        block_on(self.stream.close())?;
-        self.finished = true;
-
-        Ok(())
-    }
-}
-
-impl Drop for LogwebSender {
-    fn drop(&mut self) {
-        let _ = self.send(&Message {
-            producer: self.producer.clone(),
-            content: MessageContent::TrapDown {
-                occurrence: unix_timestamp(),
-            },
-        });
-        let _ = self.flush();
-        let _ = self.finish();
-    }
-}
-
-pub struct LogwebReceiver {
-    stream: Lz4Decoder<BufReader<TokioTcpStream>>,
-    buffer: bitcode::Buffer,
-    buffer2: Vec<u8>,
-}
-
-impl LogwebReceiver {
-    pub fn new(stream: TokioTcpStream) -> Self {
-        Self {
-            stream: Lz4Decoder::new(BufReader::new(stream)),
-            buffer: bitcode::Buffer::new(),
-            buffer2: Vec::new(),
-        }
-    }
-
-    pub async fn recv(&mut self) -> io::Result<Message> {
-        let mut len_buf = [0u8; 4];
-        self.stream.read_exact(&mut len_buf).await?;
-
-        let len = u32::from_be_bytes(len_buf) as usize;
-
-        if self.buffer2.len() < len {
-            self.buffer2.resize(len, 0);
-        }
-
-        self.stream.read_exact(&mut self.buffer2[..len]).await?;
-
-        self.buffer
-            .decode(&self.buffer2[..len])
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))
-    }
-}
-
-pub fn unix_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time is before unix epoch")
-        .as_secs()
+    Ok(OwnedLog {
+        timestamp,
+        producer,
+        message,
+    })
 }

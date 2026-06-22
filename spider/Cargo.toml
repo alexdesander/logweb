@@ -9,4 +9,5 @@ clap.workspace = true
 tokio.workspace = true
 color-eyre.workspace = true
 rusqlite.workspace = true
-crossbeam = "0.8.4"
+async-compression = { version = "0.4.42", features = ["tokio", "zstd"] }
+rustc-hash = "2.1.2"

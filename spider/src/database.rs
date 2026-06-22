@@ -1,172 +1,160 @@
-use std::path::Path;
+use std::{net::SocketAddr, path::Path};
 
-use color_eyre::eyre::Result;
-use common::{Log, Message, MessageContent};
+use color_eyre::{Result, eyre::Context};
 use rusqlite::{Connection, params};
-use tokio::sync::mpsc::Receiver;
+use rustc_hash::FxHashMap;
 
-const META_LEVEL: i64 = 7;
-
-pub struct DatabaseConnection {
-    connection: Connection,
+#[derive(Debug, Clone)]
+pub struct StoredLog {
+    pub timestamp_utc_usec: u64,
+    pub sender: SocketAddr,
+    pub producer: String,
+    pub message: String,
 }
 
-impl DatabaseConnection {
-    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Ok(Self {
-            connection: Connection::open(path)?,
-        })
-    }
+fn create_tables(con: &Connection) -> Result<()> {
+    con.execute_batch(
+        r#"
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = NORMAL;
+        PRAGMA foreign_keys = ON;
 
-    pub fn create_tables(&mut self) -> Result<()> {
-        self.connection.execute_batch(
+        CREATE TABLE IF NOT EXISTS producers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE
+        );
+
+        CREATE TABLE IF NOT EXISTS senders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            addr TEXT NOT NULL UNIQUE
+        );
+
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp_utc_usec INTEGER NOT NULL,
+            sender_id INTEGER NOT NULL,
+            producer_id INTEGER NOT NULL,
+            message TEXT NOT NULL,
+
+            FOREIGN KEY (sender_id)
+                REFERENCES senders(id)
+                ON DELETE RESTRICT,
+
+            FOREIGN KEY (producer_id)
+                REFERENCES producers(id)
+                ON DELETE RESTRICT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_messages_sender_id
+            ON messages(sender_id);
+
+        CREATE INDEX IF NOT EXISTS idx_messages_producer_id
+            ON messages(producer_id);
+        "#,
+    )?;
+
+    Ok(())
+}
+
+pub fn connect(path: impl AsRef<Path>) -> Result<Connection> {
+    let con = Connection::open(path).wrap_err("failed to open SQLite database")?;
+    create_tables(&con).wrap_err("failed to initialize SQLite database")?;
+    Ok(con)
+}
+
+pub fn insert_logs(con: &mut Connection, logs: &[StoredLog]) -> Result<()> {
+    let tx = con.transaction()?;
+
+    {
+        let mut sender_cache: FxHashMap<SocketAddr, i64> = FxHashMap::default();
+        let mut producer_cache: FxHashMap<&str, i64> = FxHashMap::default();
+
+        let mut insert_sender = tx.prepare("INSERT OR IGNORE INTO senders (addr) VALUES (?1)")?;
+
+        let mut select_sender = tx.prepare("SELECT id FROM senders WHERE addr = ?1")?;
+
+        let mut insert_producer =
+            tx.prepare("INSERT OR IGNORE INTO producers (name) VALUES (?1)")?;
+
+        let mut select_producer = tx.prepare("SELECT id FROM producers WHERE name = ?1")?;
+
+        let mut insert_message = tx.prepare(
             r#"
-            PRAGMA journal_mode = WAL;
-            PRAGMA foreign_keys = ON;
-            "#,
-        )?;
-
-        let tx = self.connection.transaction()?;
-
-        tx.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS Level (
-                id   INTEGER PRIMARY KEY,
-                text TEXT NOT NULL UNIQUE
-            );
-
-            CREATE TABLE IF NOT EXISTS Producer (
-                id   INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE
-            );
-
-            CREATE TABLE IF NOT EXISTS Log (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                producer   INTEGER NOT NULL,
-                occurrence INTEGER NOT NULL,
-                level      INTEGER NOT NULL,
-                content    TEXT NOT NULL,
-
-                FOREIGN KEY (producer) REFERENCES Producer(id),
-                FOREIGN KEY (level) REFERENCES Level(id)
-            );
-            "#,
-        )?;
-
-        tx.execute(
-            r#"
-            INSERT OR IGNORE INTO Level (id, text)
-            VALUES
-                (0, 'UNKNOWN'),
-                (1, 'TRACE'),
-                (2, 'DEBUG'),
-                (3, 'INFO'),
-                (4, 'WARN'),
-                (5, 'ERROR'),
-                (6, 'FATAL'),
-                (7, 'META')
-            "#,
-            [],
-        )?;
-
-        tx.commit()?;
-
-        Ok(())
-    }
-
-    fn get_or_create_producer_id(tx: &rusqlite::Transaction<'_>, producer: &str) -> Result<i64> {
-        tx.execute(
-            r#"
-            INSERT OR IGNORE INTO Producer (name)
-            VALUES (?1)
-            "#,
-            params![producer],
-        )?;
-
-        let producer_id: i64 = tx.query_row(
-            r#"
-            SELECT id
-            FROM Producer
-            WHERE name = ?1
-            "#,
-            params![producer],
-            |row| row.get(0),
-        )?;
-
-        Ok(producer_id)
-    }
-
-    pub fn write_logs(&mut self, producer: &str, logs: &[Log]) -> Result<()> {
-        let tx = self.connection.transaction()?;
-        let producer_id = Self::get_or_create_producer_id(&tx, producer)?;
-
-        for log in logs {
-            tx.execute(
-                r#"
-                INSERT INTO Log (
-                    producer,
-                    occurrence,
-                    level,
-                    content
-                )
-                VALUES (?1, ?2, ?3, ?4)
-                "#,
-                params![
-                    producer_id,
-                    log.occurrence as i64,
-                    log.level as i64,
-                    &log.content,
-                ],
-            )?;
-        }
-
-        tx.commit()?;
-
-        Ok(())
-    }
-
-    pub fn write_meta_log(&mut self, producer: &str, occurrence: u64, content: &str) -> Result<()> {
-        let tx = self.connection.transaction()?;
-        let producer_id = Self::get_or_create_producer_id(&tx, producer)?;
-
-        tx.execute(
-            r#"
-            INSERT INTO Log (
-                producer,
-                occurrence,
-                level,
-                content
+            INSERT INTO messages (
+                timestamp_utc_usec,
+                sender_id,
+                producer_id,
+                message
             )
             VALUES (?1, ?2, ?3, ?4)
             "#,
-            params![producer_id, occurrence as i64, META_LEVEL, content,],
         )?;
 
-        tx.commit()?;
+        for log in logs {
+            let sender_id = match sender_cache.get(&log.sender) {
+                Some(id) => *id,
+                None => {
+                    let sender = log.sender.to_string();
 
-        Ok(())
-    }
-}
+                    insert_sender.execute(params![&sender])?;
 
-/// This is run in its own dedicated thread and only appends
-/// logs to the database.
-pub fn log_append_thread(mut db: DatabaseConnection, mut rx: Receiver<Message>) -> Result<()> {
-    while let Some(msg) = rx.blocking_recv() {
-        match msg.content {
-            MessageContent::Logs(logs) => {
-                db.write_logs(&msg.producer, &logs)?;
-            }
-            MessageContent::TrapInit { occurrence } => {
-                db.write_meta_log(&msg.producer, occurrence, "trap initialized")?;
-            }
-            MessageContent::TrapDown { occurrence } => {
-                db.write_meta_log(&msg.producer, occurrence, "trap down")?;
-            }
-            MessageContent::Truncated => {
-                db.write_meta_log(&msg.producer, 0, "logs truncated")?;
-            }
+                    let id: i64 = select_sender.query_row(params![&sender], |row| row.get(0))?;
+
+                    sender_cache.insert(log.sender, id);
+                    id
+                }
+            };
+
+            let producer = log.producer.as_str();
+
+            let producer_id = match producer_cache.get(producer) {
+                Some(id) => *id,
+                None => {
+                    insert_producer.execute(params![producer])?;
+
+                    let id: i64 = select_producer.query_row(params![producer], |row| row.get(0))?;
+
+                    producer_cache.insert(producer, id);
+                    id
+                }
+            };
+
+            let timestamp_utc_usec: i64 = log
+                .timestamp_utc_usec
+                .try_into()
+                .wrap_err("timestamp_utc_usec does not fit into SQLite INTEGER")?;
+
+            insert_message.execute(params![
+                timestamp_utc_usec,
+                sender_id,
+                producer_id,
+                &log.message,
+            ])?;
         }
     }
 
+    tx.commit()?;
     Ok(())
+}
+
+pub fn insert_logs_best_effort(con: &mut Connection, logs: &[StoredLog]) -> usize {
+    if let Err(err) = insert_logs(con, logs) {
+        eprintln!("database batch insert failed; retrying records individually: {err:?}");
+
+        let mut dropped = 0;
+
+        for log in logs {
+            if let Err(err) = insert_logs(con, std::slice::from_ref(log)) {
+                dropped += 1;
+                eprintln!(
+                    "dropping log record after database insert failure: sender={} producer={:?} timestamp_utc_usec={} error={err:?}",
+                    log.sender, log.producer, log.timestamp_utc_usec
+                );
+            }
+        }
+
+        dropped
+    } else {
+        0
+    }
 }

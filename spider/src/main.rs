@@ -1,21 +1,27 @@
 use std::{
+    io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     time::Duration,
 };
 
+use async_compression::tokio::bufread::ZstdDecoder;
 use clap::Parser;
 use color_eyre::{
     Report,
-    eyre::{Context, Result, bail},
+    eyre::{Context, Result, eyre},
 };
-use common::{LogwebReceiver, Message, MessageContent};
+use common::{OwnedLog, deserialize_log_async};
 use tokio::{
+    io::BufReader,
     net::{TcpListener, TcpStream},
-    sync::mpsc::Sender,
+    sync::mpsc,
 };
 
-use crate::database::{DatabaseConnection, log_append_thread};
+use crate::database::StoredLog;
+
+const LOG_CHANNEL_CAPACITY: usize = 8_192;
+const LOG_BATCH_MAX_RECORDS: usize = 256;
 
 mod database;
 
@@ -24,7 +30,7 @@ mod database;
 struct Cli {
     /// The port that traps have to connect with.
     listening_port: u16,
-    /// The filepath where the logs should be stored.
+    /// Where the SQLite database is stored.
     database_path: PathBuf,
 }
 
@@ -33,17 +39,7 @@ async fn main() -> Result<()> {
     color_eyre::install()?;
 
     let cli = Cli::parse();
-
-    let mut database = DatabaseConnection::new(cli.database_path)?;
-    database.create_tables()?;
-
-    let (log_append_tx, log_append_rx) = tokio::sync::mpsc::channel(8192);
-
-    let _log_append_thread = std::thread::spawn(move || {
-        if let Err(err) = log_append_thread(database, log_append_rx) {
-            eprintln!("log append thread failed: {err}");
-        }
-    });
+    let database = database::connect(&cli.database_path)?;
 
     let listen_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), cli.listening_port);
 
@@ -51,15 +47,23 @@ async fn main() -> Result<()> {
         .await
         .wrap_err_with(|| format!("failed to bind listener on {listen_addr}"))?;
 
+    let (log_tx, log_rx) = mpsc::channel(LOG_CHANNEL_CAPACITY);
+
+    tokio::task::spawn_blocking(move || {
+        if let Err(err) = database_writer_task(database, log_rx) {
+            eprintln!("database writer task failed: {err:?}");
+        }
+    });
+
     println!("Listening on {listen_addr}");
 
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
-                let log_append_tx = log_append_tx.clone();
+                let log_tx = log_tx.clone();
 
                 tokio::spawn(async move {
-                    handle_trap_connection(stream, addr, log_append_tx).await;
+                    handle_trap_connection(stream, addr, log_tx).await;
                 });
             }
             Err(err) => {
@@ -75,9 +79,9 @@ async fn main() -> Result<()> {
 async fn handle_trap_connection(
     stream: TcpStream,
     addr: SocketAddr,
-    log_append_tx: Sender<Message>,
+    log_tx: mpsc::Sender<StoredLog>,
 ) {
-    match process_trap(stream, addr, log_append_tx).await {
+    match process_trap(stream, addr, log_tx).await {
         Ok(()) => {
             println!("[{addr}] connection closed");
         }
@@ -90,69 +94,75 @@ async fn handle_trap_connection(
 async fn process_trap(
     stream: TcpStream,
     addr: SocketAddr,
-    log_append_tx: Sender<Message>,
+    log_tx: mpsc::Sender<StoredLog>,
 ) -> Result<()> {
-    let mut stream = LogwebReceiver::new(stream);
+    stream
+        .set_nodelay(true)
+        .wrap_err("failed to set TCP_NODELAY")?;
 
-    let first_msg = stream
-        .recv()
-        .await
-        .wrap_err("failed to receive initial trap message")?;
+    let reader = BufReader::new(stream);
 
-    match &first_msg.content {
-        MessageContent::TrapInit { .. } => {
-            println!("[{addr}] trap initialized");
-
-            log_append_tx
-                .send(first_msg)
-                .await
-                .wrap_err("failed to queue initial trap message for database write")?;
-        }
-        other => {
-            bail!(
-                "expected TrapInit as first message, received {}",
-                message_kind(other)
-            );
-        }
-    }
+    // This must live for the whole connection because the sender writes one
+    // continuous zstd stream.
+    let mut decoder = ZstdDecoder::new(reader);
 
     loop {
-        let msg = stream
-            .recv()
-            .await
-            .wrap_err("failed to receive trap message")?;
-
-        match &msg.content {
-            MessageContent::TrapInit { .. } => {
-                bail!("received TrapInit more than once");
+        match deserialize_log_async(&mut decoder).await {
+            Ok(log) => {
+                process_log(addr, log, &log_tx).await?;
             }
-            MessageContent::TrapDown { .. } => {
-                println!("[{addr}] trap down");
-
-                log_append_tx
-                    .send(msg)
-                    .await
-                    .wrap_err("failed to queue TrapDown message for database write")?;
-
-                break;
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+                return Ok(());
             }
-            MessageContent::Logs(logs) => {
-                println!("[{addr}] received logs: {}", logs.len());
-
-                log_append_tx
-                    .send(msg)
-                    .await
-                    .wrap_err("failed to queue logs for database write")?;
-            }
-            MessageContent::Truncated => {
-                println!("[{addr}] logs truncated");
-
-                log_append_tx
-                    .send(msg)
-                    .await
-                    .wrap_err("failed to queue Truncated message for database write")?;
+            Err(err) => {
+                return Err(err).wrap_err("failed to deserialize log record");
             }
         }
+    }
+}
+
+async fn process_log(
+    sender: SocketAddr,
+    log: OwnedLog,
+    log_tx: &mpsc::Sender<StoredLog>,
+) -> Result<()> {
+    log_tx
+        .send(StoredLog {
+            timestamp_utc_usec: log.timestamp,
+            sender,
+            producer: log.producer,
+            message: log.message,
+        })
+        .await
+        .map_err(|_| eyre!("database writer task has stopped"))?;
+
+    Ok(())
+}
+
+fn database_writer_task(
+    mut database: rusqlite::Connection,
+    mut log_rx: mpsc::Receiver<StoredLog>,
+) -> Result<()> {
+    let mut batch = Vec::with_capacity(LOG_BATCH_MAX_RECORDS);
+
+    while let Some(log) = log_rx.blocking_recv() {
+        batch.push(log);
+
+        while batch.len() < LOG_BATCH_MAX_RECORDS {
+            match log_rx.try_recv() {
+                Ok(log) => batch.push(log),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            };
+        }
+
+        let dropped = database::insert_logs_best_effort(&mut database, &batch);
+
+        if dropped > 0 {
+            eprintln!("dropped {dropped} log records during database write");
+        }
+
+        batch.clear();
     }
 
     Ok(())
@@ -171,13 +181,4 @@ fn print_connection_error(addr: SocketAddr, err: &Report) {
     }
 
     eprintln!();
-}
-
-fn message_kind(content: &MessageContent) -> &'static str {
-    match content {
-        MessageContent::TrapInit { .. } => "TrapInit",
-        MessageContent::TrapDown { .. } => "TrapDown",
-        MessageContent::Logs(_) => "Logs",
-        MessageContent::Truncated => "Truncated",
-    }
 }
