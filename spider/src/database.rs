@@ -19,38 +19,43 @@ impl DatabaseConnection {
     }
 
     pub fn create_tables(&mut self) -> Result<()> {
+        self.connection.execute_batch(
+            r#"
+            PRAGMA journal_mode = WAL;
+            PRAGMA foreign_keys = ON;
+            "#,
+        )?;
+
         let tx = self.connection.transaction()?;
 
         tx.execute_batch(
             r#"
-            PRAGMA foreign_keys = ON;
-
             CREATE TABLE IF NOT EXISTS Level (
-                number INTEGER PRIMARY KEY,
-                text   TEXT NOT NULL UNIQUE
+                id   INTEGER PRIMARY KEY,
+                text TEXT NOT NULL UNIQUE
             );
 
             CREATE TABLE IF NOT EXISTS Producer (
-                number INTEGER PRIMARY KEY AUTOINCREMENT,
-                name   TEXT NOT NULL UNIQUE
+                id   INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE
             );
 
             CREATE TABLE IF NOT EXISTS Log (
-                number     INTEGER PRIMARY KEY AUTOINCREMENT,
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 producer   INTEGER NOT NULL,
-                occurance  INTEGER NOT NULL,
+                occurrence INTEGER NOT NULL,
                 level      INTEGER NOT NULL,
                 content    TEXT NOT NULL,
 
-                FOREIGN KEY (producer) REFERENCES Producer(number),
-                FOREIGN KEY (level) REFERENCES Level(number)
+                FOREIGN KEY (producer) REFERENCES Producer(id),
+                FOREIGN KEY (level) REFERENCES Level(id)
             );
             "#,
         )?;
 
         tx.execute(
             r#"
-            INSERT OR IGNORE INTO Level (number, text)
+            INSERT OR IGNORE INTO Level (id, text)
             VALUES
                 (0, 'UNKNOWN'),
                 (1, 'TRACE'),
@@ -80,7 +85,7 @@ impl DatabaseConnection {
 
         let producer_id: i64 = tx.query_row(
             r#"
-            SELECT number
+            SELECT id
             FROM Producer
             WHERE name = ?1
             "#,
@@ -100,7 +105,7 @@ impl DatabaseConnection {
                 r#"
                 INSERT INTO Log (
                     producer,
-                    occurance,
+                    occurrence,
                     level,
                     content
                 )
@@ -108,7 +113,7 @@ impl DatabaseConnection {
                 "#,
                 params![
                     producer_id,
-                    log.occurance as i64,
+                    log.occurrence as i64,
                     log.level as i64,
                     &log.content,
                 ],
@@ -120,7 +125,7 @@ impl DatabaseConnection {
         Ok(())
     }
 
-    pub fn write_meta_log(&mut self, producer: &str, occurance: u64, content: &str) -> Result<()> {
+    pub fn write_meta_log(&mut self, producer: &str, occurrence: u64, content: &str) -> Result<()> {
         let tx = self.connection.transaction()?;
         let producer_id = Self::get_or_create_producer_id(&tx, producer)?;
 
@@ -128,13 +133,13 @@ impl DatabaseConnection {
             r#"
             INSERT INTO Log (
                 producer,
-                occurance,
+                occurrence,
                 level,
                 content
             )
             VALUES (?1, ?2, ?3, ?4)
             "#,
-            params![producer_id, occurance as i64, META_LEVEL, content,],
+            params![producer_id, occurrence as i64, META_LEVEL, content,],
         )?;
 
         tx.commit()?;
@@ -151,11 +156,11 @@ pub fn log_append_thread(mut db: DatabaseConnection, mut rx: Receiver<Message>) 
             MessageContent::Logs(logs) => {
                 db.write_logs(&msg.producer, &logs)?;
             }
-            MessageContent::TrapInit { occurance } => {
-                db.write_meta_log(&msg.producer, occurance, "trap initialized")?;
+            MessageContent::TrapInit { occurrence } => {
+                db.write_meta_log(&msg.producer, occurrence, "trap initialized")?;
             }
-            MessageContent::TrapDown { occurance } => {
-                db.write_meta_log(&msg.producer, occurance, "trap down")?;
+            MessageContent::TrapDown { occurrence } => {
+                db.write_meta_log(&msg.producer, occurrence, "trap down")?;
             }
             MessageContent::Truncated => {
                 db.write_meta_log(&msg.producer, 0, "logs truncated")?;

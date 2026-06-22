@@ -1,6 +1,6 @@
 use clap::Parser;
 use color_eyre::eyre::Result;
-use common::{Log, LogLevel, LogwebSender, Message, MessageContent};
+use common::{Log, LogLevel, LogwebSender, Message, MessageContent, unix_timestamp};
 use std::{
     io::{self, BufRead},
     net::TcpStream,
@@ -107,7 +107,7 @@ fn main() -> Result<()> {
         let queued_log = QueuedLog {
             approx_bytes: approx_log_size(&content),
             log: Log {
-                occurance: unix_timestamp(),
+                occurrence: unix_timestamp(),
                 // LogLevel is classified later in the sending_thread,
                 // to take work off the main thread.
                 level: LogLevel::Unknown,
@@ -155,7 +155,7 @@ fn sending_thread(
             }
         };
 
-        let mut sender = LogwebSender::new(stream);
+        let mut sender = LogwebSender::new(config.producer.clone(), stream);
         connected.store(true, Ordering::Relaxed);
 
         if send_truncated_if_needed(&mut sender, &config.producer, &skipped_logs)
@@ -291,11 +291,4 @@ fn flush(sender: &mut LogwebSender, producer: &str, batch: &mut Vec<Log>) -> io:
 
 fn approx_log_size(content: &str) -> usize {
     content.len() + std::mem::size_of::<u64>() + std::mem::size_of::<LogLevel>() + 16
-}
-
-fn unix_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time is before unix epoch")
-        .as_secs()
 }

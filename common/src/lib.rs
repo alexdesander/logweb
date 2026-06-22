@@ -1,4 +1,8 @@
-use std::{io, net::TcpStream as StdTcpStream};
+use std::{
+    io,
+    net::TcpStream as StdTcpStream,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use async_compression::{futures::write::Lz4Encoder as SyncLz4Encoder, tokio::bufread::Lz4Decoder};
 use bitcode::{Decode, Encode};
@@ -25,16 +29,16 @@ pub enum LogLevel {
 
 #[derive(Clone, Encode, Decode)]
 pub struct Log {
-    /// unix timestamp
-    pub occurance: u64,
+    /// unix timestamp (UTC)
+    pub occurrence: u64,
     pub level: LogLevel,
     pub content: String,
 }
 
 #[derive(Clone, Encode, Decode)]
 pub enum MessageContent {
-    TrapInit { occurance: u64 },
-    TrapDown { occurance: u64 },
+    TrapInit { occurrence: u64 },
+    TrapDown { occurrence: u64 },
     Logs(Vec<Log>),
     Truncated,
 }
@@ -46,21 +50,25 @@ pub struct Message {
 }
 
 pub struct LogwebSender {
+    producer: String,
     stream: SyncLz4Encoder<AllowStdIo<StdTcpStream>>,
     buffer: bitcode::Buffer,
     finished: bool,
 }
 
 impl LogwebSender {
-    pub fn new(stream: StdTcpStream) -> Self {
+    pub fn new(producer: String, stream: StdTcpStream) -> Self {
         let mut s = Self {
+            producer: producer.clone(),
             stream: SyncLz4Encoder::new(AllowStdIo::new(stream)),
             buffer: bitcode::Buffer::new(),
             finished: false,
         };
         let _ = s.send(&Message {
-            producer: "".into(),
-            content: MessageContent::TrapInit { occurance: 0 },
+            producer,
+            content: MessageContent::TrapInit {
+                occurrence: unix_timestamp(),
+            },
         });
         let _ = s.flush();
         s
@@ -117,8 +125,10 @@ impl LogwebSender {
 impl Drop for LogwebSender {
     fn drop(&mut self) {
         let _ = self.send(&Message {
-            producer: "".into(),
-            content: MessageContent::TrapDown { occurance: 0 },
+            producer: self.producer.clone(),
+            content: MessageContent::TrapDown {
+                occurrence: unix_timestamp(),
+            },
         });
         let _ = self.flush();
         let _ = self.finish();
@@ -156,4 +166,11 @@ impl LogwebReceiver {
             .decode(&self.buffer2[..len])
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))
     }
+}
+
+pub fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time is before unix epoch")
+        .as_secs()
 }

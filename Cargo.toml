@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["common", "spider", "trap"]
+members = ["common", "inspector", "spider", "trap"]
 
 [profile.release]
 lto = true
@@ -12,3 +12,4 @@ bitcode = "0.6.9"
 tokio = { version = "1.52.3", features = ["full"] }
 clap = { version = "4.6.1", features = ["derive", "env"] }
 color-eyre = "0.6.5"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
